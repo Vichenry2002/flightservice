@@ -8,7 +8,7 @@ def main():
     data_server_url = os.getenv('DATA_SERVER')
     strategy = AAPLVolumeStrategy()
     strategy.initialize(data_server_url)
-    strategy.execute()
+    strategy.execute(data_server_url)
     
 if __name__ == "__main__":
     main()

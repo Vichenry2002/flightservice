@@ -5,8 +5,8 @@ main = Blueprint('main', __name__)
 
 @main.route('/data')
 def get_data():
-    instruments = request.args.getlist('instruments')
-    indicators = request.args.getlist('indicators')
+    instruments = request.args.get('instruments','').split(',')
+    indicators = request.args.get('indicators','').split(',')
     if 'timestamp' not in indicators:
         indicators.append('timestamp')
     
@@ -15,7 +15,6 @@ def get_data():
         query = f"SELECT {', '.join(indicators)} FROM company WHERE symbol = ?"
         result = query_db(query, (instrument,))
         if result:
-            # Assumes that result is a list of tuples, even if one tuple is returned
             data[instrument] = dict(zip(indicators, result[0]))
         else:
             data[instrument] = {indicator: None for indicator in indicators}

@@ -1,21 +1,42 @@
-use arrow::array::{ArrayRef, StringArray, Int32Array, BooleanArray};
-use arrow::datatypes::{Schema, Field, DataType};
-use arrow::record_batch::RecordBatch;
-use arrow_flight::{FlightEndpoint};
-use arrow_flight::flight_descriptor::DescriptorType;
-use arrow_flight::encode::FlightDataEncoderBuilder;
-use futures::{TryStreamExt};
-use tonic::{Request, Response, Status, Streaming};
-use arrow_flight::{
-    flight_service_server::{FlightService, FlightServiceServer}, 
-    PollInfo,Action, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest, HandshakeResponse, PutResult, SchemaResult, Ticket, ActionType
-};
-use futures::stream::BoxStream;
+// Standard library imports
 use std::collections::HashMap;
 use std::sync::Arc;
+// Serialization
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use serde_json::Value;
+// Async and futures handling
+use futures::{TryStreamExt, stream::BoxStream};
 use tokio::sync::Mutex;
+// Arrow and Arrow Flight related imports
+use arrow::{
+    array::{ArrayRef, StringArray, Int32Array, BooleanArray, Float64Array, Int64Array},
+    datatypes::{Schema, Field, DataType},
+    record_batch::RecordBatch,
+};
+use arrow_flight::{
+    FlightEndpoint, FlightDescriptor,
+    flight_service_server::{FlightService, FlightServiceServer},
+    PollInfo, Action, Criteria, Empty, FlightData, FlightInfo, 
+    HandshakeRequest, HandshakeResponse, PutResult, SchemaResult, Ticket, ActionType
+};
+use arrow_flight::flight_descriptor::DescriptorType;
+use arrow_flight::encode::FlightDataEncoderBuilder;
+// Tonic gRPC framework
+use tonic::{Request, Response, Status, Streaming, Code};
+//Env variable imports
+use dotenv::dotenv;
+use std::env;
 
+
+#[derive(Serialize, Deserialize, Debug)]
+struct QDQueryDescriptor {
+    datasource: String,
+    instruments: Vec<String>,  
+    indicators: Vec<String>,
+    start_date: String,  
+    end_date: String,
+}
 
 //The descriptor_type (an integer value indicating whether the descriptor is a path or command),
 //The command (a string, if applicable, otherwise None), and
@@ -64,6 +85,94 @@ impl MyFlightService {
         flight_info
 
     }
+
+    //utility function
+    async fn make_new_flight_info(&self, key: &FlightKey, batch: RecordBatch, descriptor: FlightDescriptor) -> FlightInfo  {
+
+        let (descriptor_type, command, path) = key;
+
+        //unsure of what a ticket would actually consist of.
+        let ticket_contents = json!({
+            "descriptor_type": descriptor_type,
+            "command": command,
+            "path": path
+        }).to_string();
+
+        let flight_info = FlightInfo::new()
+            .try_with_schema(batch.schema().as_ref())
+            .expect("encoding failed")
+            .with_endpoint(
+                FlightEndpoint::new().with_ticket(Ticket::new(ticket_contents.as_bytes().to_vec()))
+            )
+            .with_descriptor(descriptor);
+
+        //Adding new record batch to flights hashmap 
+        let arc_batch = Arc::new(batch);
+        let mut flights_lock = self.flights.lock().await; // Acquire the lock
+        flights_lock.insert(key.clone(), arc_batch); // Insert the batch with the key into the hashmap
+        flight_info
+
+    }
+
+    //utility function
+    fn process_data(data: Value) -> Result<RecordBatch, Status> {
+        // Extract the inner "data" object directly
+        let map = data.get("data").and_then(|v| v.as_object()).ok_or_else(|| Status::internal("Missing 'data' field or not an object"))?;
+    
+        let mut instrument_names: Vec<String> = Vec::new();
+        let mut timestamps: Vec<Option<i64>> = Vec::new();
+        let mut indicator_values: HashMap<String, Vec<Option<f64>>> = HashMap::new();
+    
+        // Process each instrument in the data
+        for (instrument, indicators) in map {
+            instrument_names.push(instrument.clone());
+            let indicators_map = indicators.as_object().ok_or_else(|| Status::internal("Indicators should be an object"))?;
+    
+            // Process each indicator, ensuring 'timestamp' is also considered
+            let timestamp = indicators_map.get("timestamp").and_then(|v| v.as_i64());
+            timestamps.push(timestamp);
+    
+            for (indicator, value) in indicators_map {
+                if indicator != "timestamp" {
+                    let val = value.as_f64();
+                    indicator_values.entry(indicator.clone()).or_insert_with(Vec::new).push(val);
+                }
+            }
+        }
+    
+        // Ensure all vectors in indicator_values are of the same length
+        for values in indicator_values.values_mut() {
+            while values.len() < instrument_names.len() {
+                values.push(None); // Pad with None if any indicators are missing
+            }
+        }
+    
+        // Create the schema for the RecordBatch
+        let mut fields = vec![
+            Field::new("instrument", DataType::Utf8, false),
+            Field::new("timestamp", DataType::Int64, true),
+        ];
+        for indicator in indicator_values.keys() {
+            fields.push(Field::new(indicator, DataType::Float64, true));
+        }
+        let schema = Schema::new(fields);
+    
+        // Create arrays for each column
+        let instrument_array = Arc::new(StringArray::from(instrument_names)) as ArrayRef;
+        let timestamp_array = Arc::new(Int64Array::from(timestamps)) as ArrayRef;
+        let mut arrays: Vec<ArrayRef> = vec![instrument_array, timestamp_array];
+        for (_indicator, values) in indicator_values.iter() {
+            let array = Arc::new(Float64Array::from(values.clone())) as ArrayRef;
+            arrays.push(array);
+        }
+    
+        // Create the record batch
+        let batch = RecordBatch::try_new(Arc::new(schema), arrays)
+            .map_err(|e| Status::internal(format!("Failed to create RecordBatch: {}", e)));
+    
+        batch
+    }
+    
 }
 
 #[tonic::async_trait]
@@ -118,19 +227,60 @@ impl FlightService for MyFlightService {
     ) -> Result<Response<FlightInfo>, Status> {
 
         let descriptor = _request.into_inner();
+        
         // Use descriptor_to_key to convert the FlightDescriptor to a key
         let key = Self::descriptor_to_key(&descriptor);
 
-        let flights_lock = self.flights.lock().await;
-    
-        match flights_lock.get(&key) {
+        let batch = {
+            let flights = self.flights.lock().await;
+            flights.get(&key).cloned()
+        };
+
+        match batch {
             Some(batch) => {
-                return Ok(Response::new(self.make_flight_info(&key, batch, descriptor)));
+                //Means batch already exists in dataserver
+                return Ok(Response::new(self.make_flight_info(&key, &batch, descriptor)));
             },
             None => {
-                // If the key does not exist, return an error status
-                // Note for future: if not found in memory, use flight descriptor to query data lake using JSON DSL from "cmd" field.
-                Err(Status::not_found("Flight not found"))
+                // If the key does not exist, go fetch info from datalake
+                let cmd = String::from_utf8(descriptor.cmd.to_vec()).unwrap();
+
+                // Parse the command
+                let qd_query: QDQueryDescriptor = serde_json::from_str(&cmd).unwrap();
+                let instruments = qd_query.instruments.join(",");
+                let indicators = qd_query.indicators.join(",");
+
+                //Send request to toy datalake
+                dotenv().ok();
+                let url_address = env::var("DATA_LAKE_ADDRESS").expect("DATA_LAKE_ADDRESS must be set");
+                let client = reqwest::Client::new();
+                let url = format!("{}/api/data?instruments={}&indicators={}", url_address, instruments, indicators);
+                println!("Request URL: {}", url); 
+                
+                let response = client.get(&url).send().await;
+
+                
+                match response {
+                    Ok(resp) => {
+                        if resp.status().is_success() {
+                            let data: Value = resp.json().await.unwrap(); // handle JSON response
+                            //tranform JSON data into record batch
+                            let new_batch =  MyFlightService::process_data(data);
+
+                            match new_batch {
+                                Ok(batch) => {
+                                    Ok(Response::new(self.make_new_flight_info(&key, batch, descriptor).await))
+                                }
+                                _ => {
+                                    Err(Status::internal("Failed to create flight info"))
+                                }
+                            }                            
+                        } else {
+                            Err(Status::internal("Failed to fetch data from API"))
+                        }
+                    },
+                    Err(_) => Err(Status::internal("API request failed"))
+                }
             },
         }
     }
@@ -230,7 +380,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = "[::1]:50051".parse().unwrap();
     let service = MyFlightService {
-        flights: initialize_test_flights(),
+        flights: Arc::new(Mutex::new(HashMap::new())),
     };
     let server = FlightServiceServer::new(service);
     
@@ -241,61 +391,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
     
 }
-
-fn initialize_test_flights() -> Arc<Mutex<HashMap<FlightKey, Arc<RecordBatch>>>> {
-    let string_values = vec!["a", "b", "c"];
-    let string_array: ArrayRef = Arc::new(StringArray::from(string_values));
-
-    let int_values = vec![1, 2, 3];
-    let int_array: ArrayRef = Arc::new(Int32Array::from(int_values));
-
-    let bool_values = vec![true, false, true];
-    let bool_array: ArrayRef = Arc::new(BooleanArray::from(bool_values));
-
-    let string_values1 = vec!["v", "i", "c"];
-    let string_array1: ArrayRef = Arc::new(StringArray::from(string_values1));
-
-    let int_value1 = vec![7, 27, 0];
-    let int_array1: ArrayRef = Arc::new(Int32Array::from(int_value1));
-
-    let bool_values1 = vec![false, false, false];
-    let bool_array1: ArrayRef = Arc::new(BooleanArray::from(bool_values1));
-
-    // Define a schema for the RecordBatch
-    let schema = Schema::new(vec![
-        Field::new("chars", DataType::Utf8, false),
-        Field::new("numbers", DataType::Int32, false),
-        Field::new("booleans", DataType::Boolean, false),
-    ]);
-    let schema1 = Schema::new(vec![
-        Field::new("chars", DataType::Utf8, false),
-        Field::new("numbers", DataType::Int32, false),
-        Field::new("booleans", DataType::Boolean, false),
-    ]);
-
-
-    // Create the RecordBatch
-    let rc = RecordBatch::try_new(Arc::new(schema), vec![string_array, int_array, bool_array]);
-    let rc1 = RecordBatch::try_new(Arc::new(schema1), vec![string_array1, int_array1, bool_array1]);
-    
-    let batch = rc.map_err(|e| Box::new(e) as Box<dyn std::error::Error>).unwrap();
-    let batch1 = rc1.map_err(|e| Box::new(e) as Box<dyn std::error::Error>).unwrap();
-
-    let cmd = "record batch".as_bytes().to_vec();
-    let desc = FlightDescriptor::new_cmd(cmd);
-    let key = MyFlightService::descriptor_to_key(&desc);
-    let val = Arc::new(batch);
-
-    let cmd1 = "record batch 1".as_bytes().to_vec();
-    let desc1 = FlightDescriptor::new_cmd(cmd1);
-    let key1 = MyFlightService::descriptor_to_key(&desc1);
-    let val1 = Arc::new(batch1);
-    
-    let mut hash_map = HashMap::new();
-
-    hash_map.insert(key, val);
-    hash_map.insert(key1, val1);
-    Arc::new(Mutex::new(hash_map))
-}
-
-
