@@ -9,11 +9,7 @@ use serde_json::Value;
 use futures::{TryStreamExt, stream::BoxStream};
 use tokio::sync::Mutex;
 // Arrow and Arrow Flight related imports
-use arrow::{
-    array::{ArrayRef, StringArray, Int32Array, BooleanArray, Float64Array, Int64Array},
-    datatypes::{Schema, Field, DataType},
-    record_batch::RecordBatch,
-};
+use arrow::record_batch::RecordBatch;
 use arrow_flight::{
     FlightEndpoint, FlightDescriptor,
     flight_service_server::{FlightService, FlightServiceServer},
@@ -23,11 +19,11 @@ use arrow_flight::{
 use arrow_flight::flight_descriptor::DescriptorType;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 // Tonic gRPC framework
-use tonic::{Request, Response, Status, Streaming, Code};
+use tonic::{Request, Response, Status, Streaming};
 //Env variable imports
 use dotenv::dotenv;
 use std::env;
-
+mod utils;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct QDQueryDescriptor {
@@ -49,19 +45,6 @@ pub struct MyFlightService {
 }
 
 impl MyFlightService {
-    //utility function
-    fn descriptor_to_key(descriptor: &FlightDescriptor) -> (i32, Option<String>, Vec<String>) {
-
-        let descriptor_type = descriptor.r#type() as i32;
-        let command = match descriptor.r#type() {
-            DescriptorType::Cmd => Some(String::from_utf8(descriptor.cmd.to_vec()).unwrap_or_default()),
-            _ => None,
-        };
-        let path = descriptor.path.clone();
-
-        (descriptor_type, command, path)
-    }
-
     //utility function
     fn make_flight_info(&self, key: &FlightKey, batch: &Arc<RecordBatch>, descriptor: FlightDescriptor) -> FlightInfo  {
 
@@ -113,66 +96,6 @@ impl MyFlightService {
         flight_info
 
     }
-
-    //utility function
-    fn process_data(data: Value) -> Result<RecordBatch, Status> {
-        // Extract the inner "data" object directly
-        let map = data.get("data").and_then(|v| v.as_object()).ok_or_else(|| Status::internal("Missing 'data' field or not an object"))?;
-    
-        let mut instrument_names: Vec<String> = Vec::new();
-        let mut timestamps: Vec<Option<i64>> = Vec::new();
-        let mut indicator_values: HashMap<String, Vec<Option<f64>>> = HashMap::new();
-    
-        // Process each instrument in the data
-        for (instrument, indicators) in map {
-            instrument_names.push(instrument.clone());
-            let indicators_map = indicators.as_object().ok_or_else(|| Status::internal("Indicators should be an object"))?;
-    
-            // Process each indicator, ensuring 'timestamp' is also considered
-            let timestamp = indicators_map.get("timestamp").and_then(|v| v.as_i64());
-            timestamps.push(timestamp);
-    
-            for (indicator, value) in indicators_map {
-                if indicator != "timestamp" {
-                    let val = value.as_f64();
-                    indicator_values.entry(indicator.clone()).or_insert_with(Vec::new).push(val);
-                }
-            }
-        }
-    
-        // Ensure all vectors in indicator_values are of the same length
-        for values in indicator_values.values_mut() {
-            while values.len() < instrument_names.len() {
-                values.push(None); // Pad with None if any indicators are missing
-            }
-        }
-    
-        // Create the schema for the RecordBatch
-        let mut fields = vec![
-            Field::new("instrument", DataType::Utf8, false),
-            Field::new("timestamp", DataType::Int64, true),
-        ];
-        for indicator in indicator_values.keys() {
-            fields.push(Field::new(indicator, DataType::Float64, true));
-        }
-        let schema = Schema::new(fields);
-    
-        // Create arrays for each column
-        let instrument_array = Arc::new(StringArray::from(instrument_names)) as ArrayRef;
-        let timestamp_array = Arc::new(Int64Array::from(timestamps)) as ArrayRef;
-        let mut arrays: Vec<ArrayRef> = vec![instrument_array, timestamp_array];
-        for (_indicator, values) in indicator_values.iter() {
-            let array = Arc::new(Float64Array::from(values.clone())) as ArrayRef;
-            arrays.push(array);
-        }
-    
-        // Create the record batch
-        let batch = RecordBatch::try_new(Arc::new(schema), arrays)
-            .map_err(|e| Status::internal(format!("Failed to create RecordBatch: {}", e)));
-    
-        batch
-    }
-    
 }
 
 #[tonic::async_trait]
@@ -229,7 +152,7 @@ impl FlightService for MyFlightService {
         let descriptor = _request.into_inner();
         
         // Use descriptor_to_key to convert the FlightDescriptor to a key
-        let key = Self::descriptor_to_key(&descriptor);
+        let key = utils::mmap_utils::descriptor_to_key(&descriptor);
 
         let batch = {
             let flights = self.flights.lock().await;
@@ -265,7 +188,7 @@ impl FlightService for MyFlightService {
                         if resp.status().is_success() {
                             let data: Value = resp.json().await.unwrap(); // handle JSON response
                             //tranform JSON data into record batch
-                            let new_batch =  MyFlightService::process_data(data);
+                            let new_batch =  utils::mmap_utils::data_to_record_batch(data);
 
                             match new_batch {
                                 Ok(batch) => {
