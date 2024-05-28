@@ -152,7 +152,7 @@ impl FlightService for MyFlightService {
         let descriptor = _request.into_inner();
         
         // Use descriptor_to_key to convert the FlightDescriptor to a key
-        let key = utils::mmap_utils::descriptor_to_key(&descriptor);
+        let key = utils::helper::descriptor_to_key(&descriptor);
 
         let batch = {
             let flights = self.flights.lock().await;
@@ -188,7 +188,7 @@ impl FlightService for MyFlightService {
                         if resp.status().is_success() {
                             let data: Value = resp.json().await.unwrap(); // handle JSON response
                             //tranform JSON data into record batch
-                            let new_batch =  utils::mmap_utils::data_to_record_batch(data);
+                            let new_batch =  utils::helper::data_to_record_batch(data);
 
                             match new_batch {
                                 Ok(batch) => {
