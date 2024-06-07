@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 // Serialization
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use serde_json::Value;
 // Async and futures handling
 use futures::{TryStreamExt, stream::BoxStream};
@@ -16,7 +15,6 @@ use arrow_flight::{
     PollInfo, Action, Criteria, Empty, FlightData, FlightInfo, 
     HandshakeRequest, HandshakeResponse, PutResult, SchemaResult, Ticket, ActionType
 };
-use arrow_flight::flight_descriptor::DescriptorType;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 // Tonic gRPC framework
 use tonic::{Request, Response, Status, Streaming};
@@ -41,60 +39,29 @@ type FlightKey = (i32, Option<String>, Vec<String>);
 
 pub struct MyFlightService {
     //hash map which will store record batches – in memory data storage
-    flights: Arc<Mutex<HashMap<FlightKey, Arc<RecordBatch>>>>,
+    flights: Arc<Mutex<HashMap<FlightKey, FlightInfo>>>,
 }
 
 impl MyFlightService {
     //utility function
-    fn make_flight_info(&self, key: &FlightKey, batch: &Arc<RecordBatch>, descriptor: FlightDescriptor) -> FlightInfo  {
+    async fn make_new_flight_info(&self, key: &FlightKey, batch: RecordBatch, descriptor: FlightDescriptor) -> Result<FlightInfo,Status>  {
 
-        let (descriptor_type, command, path) = key;
-
-        //unsure of what a ticket would actually consist of.
-        let ticket_contents = json!({
-            "descriptor_type": descriptor_type,
-            "command": command,
-            "path": path
-        }).to_string();
+        let ticket = match utils::mmap_utils::batch_to_mmap(&batch) {
+            Ok(ticket) => ticket,
+            Err(e) => return Err(Status::internal(format!("Failed to serialize RecordBatch to mmap: {:?}", e))),
+        };
 
         let flight_info = FlightInfo::new()
             .try_with_schema(batch.schema().as_ref())
             .expect("encoding failed")
             .with_endpoint(
-                FlightEndpoint::new().with_ticket(Ticket::new(ticket_contents.as_bytes().to_vec()))
+                FlightEndpoint::new().with_ticket(ticket.clone())
             )
             .with_descriptor(descriptor);
 
-        flight_info
-
-    }
-
-    //utility function
-    async fn make_new_flight_info(&self, key: &FlightKey, batch: RecordBatch, descriptor: FlightDescriptor) -> FlightInfo  {
-
-        let (descriptor_type, command, path) = key;
-
-        //unsure of what a ticket would actually consist of.
-        let ticket_contents = json!({
-            "descriptor_type": descriptor_type,
-            "command": command,
-            "path": path
-        }).to_string();
-
-        let flight_info = FlightInfo::new()
-            .try_with_schema(batch.schema().as_ref())
-            .expect("encoding failed")
-            .with_endpoint(
-                FlightEndpoint::new().with_ticket(Ticket::new(ticket_contents.as_bytes().to_vec()))
-            )
-            .with_descriptor(descriptor);
-
-        //Adding new record batch to flights hashmap 
-        let arc_batch = Arc::new(batch);
         let mut flights_lock = self.flights.lock().await; // Acquire the lock
-        flights_lock.insert(key.clone(), arc_batch); // Insert the batch with the key into the hashmap
-        flight_info
-
+        flights_lock.insert(key.clone(), flight_info.clone()); // Insert the batch with the key into the hashmap
+        Ok(flight_info)
     }
 }
 
@@ -122,25 +89,20 @@ impl FlightService for MyFlightService {
         _request: Request<Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
         
+        // Lock the flights HashMap and get the list of FlightInfo
         let flights = self.flights.lock().await;
-    
-        let flight_infos: Vec<Result<FlightInfo, Status>> = flights.iter().map(|(key, batch)| {
-   
-            let (descriptor_type, command, path) = key;
 
-            let descriptor = match DescriptorType::try_from(*descriptor_type){
-                Ok(DescriptorType::Cmd) => match command {
-                    Some(cmd) => FlightDescriptor::new_cmd(cmd.clone().into_bytes()),
-                    None => return Err(Status::invalid_argument("Command is required for CMD descriptor type")),
-                },
-                Ok(DescriptorType::Path) => FlightDescriptor::new_path(path.clone()),
-                _ => return Err(Status::invalid_argument("Unknown descriptor type")),
-            };
+        // Collect the FlightInfo instances into a Vec<Result<FlightInfo, Status>>
+        let flight_infos: Vec<Result<FlightInfo, Status>> = flights
+            .values()
+            .cloned()
+            .map(Ok)
+            .collect();
 
-            Ok(self.make_flight_info(key, batch, descriptor))
-        }).collect();
+        // Create a futures stream from the vector
+        let output_stream = futures::stream::iter(flight_infos);
 
-        let output_stream: futures::stream::Iter<std::vec::IntoIter<Result<FlightInfo, Status>>> = futures::stream::iter(flight_infos);
+        // Return the stream as a response
         Ok(Response::new(Box::pin(output_stream)))
     }
 
@@ -154,15 +116,15 @@ impl FlightService for MyFlightService {
         // Use descriptor_to_key to convert the FlightDescriptor to a key
         let key = utils::helper::descriptor_to_key(&descriptor);
 
-        let batch = {
+        let flight_info : Option<FlightInfo> = {
             let flights = self.flights.lock().await;
             flights.get(&key).cloned()
         };
 
-        match batch {
-            Some(batch) => {
-                //Means batch already exists in dataserver
-                return Ok(Response::new(self.make_flight_info(&key, &batch, descriptor)));
+        match flight_info {
+            Some(f) => {
+                //Means flight already exists in dataserver
+                return Ok(Response::new(f));
             },
             None => {
                 // If the key does not exist, go fetch info from datalake
@@ -192,7 +154,10 @@ impl FlightService for MyFlightService {
 
                             match new_batch {
                                 Ok(batch) => {
-                                    Ok(Response::new(self.make_new_flight_info(&key, batch, descriptor).await))
+                                    match self.make_new_flight_info(&key, batch, descriptor).await {
+                                        Ok(flight_info) => Ok(Response::new(flight_info)),
+                                        Err(e) => Err(e),
+                                    }
                                 }
                                 _ => {
                                     Err(Status::internal("Failed to create flight info"))
@@ -226,46 +191,23 @@ impl FlightService for MyFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        // Deserialize the ticket to JSON
         let ticket = request.into_inner();
-        let ticket_str = String::from_utf8(ticket.ticket.to_vec())
-            .map_err(|_| Status::invalid_argument("Ticket contains invalid UTF-8"))?;
-        let ticket_json: serde_json::Value = serde_json::from_str(&ticket_str)
-            .map_err(|_| Status::invalid_argument("Ticket cannot be deserialized"))?;
-        
-        // Convert ticket JSON to FlightKey
-        let key = (
-            ticket_json["descriptor_type"].as_i64().unwrap_or_default() as i32,
-            ticket_json["command"].as_str().map(|s| s.to_string()),
-            ticket_json["path"].as_array().map_or(vec![], |v| {
-                v.iter().filter_map(|p| p.as_str().map(|s| s.to_string())).collect()
-            }),
-        );
-        let flights = self.flights.lock().await;
-        // Lock the flights map and attempt to find the corresponding batch
-        
-        if let Some(arc_batch) = flights.get(&key) {
-            let batch = Arc::clone(arc_batch);
 
-            // CLONING RECORD BATCH HERE??? Is there a way to do this without cloning record batch??
-            // Seems like this could be expensive for large record batches
-            let input_stream = futures::stream::iter(vec![Ok(batch.as_ref().clone())]);
-            
-            // Build a stream of `Result<FlightData, Status>` using FlightDataEncoderBuilder
-            let flight_data_stream = FlightDataEncoderBuilder::new()
+        // Load the RecordBatch from the memory-mapped file using the file path
+        let batch = utils::mmap_utils::mmap_to_batch(&ticket).map_err(|e| {
+            Status::internal(format!("Failed to load RecordBatch from mmap: {:?}", e))
+        })?;
+    
+        // Create the input stream with the RecordBatch
+        let input_stream = futures::stream::iter(vec![Ok(batch)]);
+    
+        // Build a stream of `Result<FlightData, Status>` using FlightDataEncoderBuilder
+        let flight_data_stream = FlightDataEncoderBuilder::new()
             .build(input_stream)
             .map_err(|e| {
-                // Convert errors to tonic::Status
                 Status::internal(format!("Internal error processing flight data: {:?}", e))
             });
-
-    
-            Ok(Response::new(Box::pin(flight_data_stream)))
-
-        } else {
-            // Handle the case where the key is not present.
-            Err(Status::not_found("Flight not found"))
-        }
+        Ok(Response::new(Box::pin(flight_data_stream)))
     }
 
     async fn do_put(
