@@ -2,6 +2,7 @@ import sqlite3
 import random
 from datetime import datetime
 
+#randomly generated mock data on companies
 companies_data = [
     ("AAPL", "Apple Inc.", random.randint(50000, 150000), random.uniform(130.00, 180.00), int(datetime.now().timestamp())),
     ("MSFT", "Microsoft Corporation", random.randint(50000, 150000), random.uniform(250.00, 350.00), int(datetime.now().timestamp())),

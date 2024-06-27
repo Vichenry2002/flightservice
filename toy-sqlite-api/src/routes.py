@@ -5,6 +5,7 @@ main = Blueprint('main', __name__)
 
 @main.route('/data')
 def get_data():
+    # API route to get data which the dataserver will call.
     instruments = request.args.get('instruments','').split(',')
     indicators = request.args.get('indicators','').split(',')
     if 'timestamp' not in indicators:

@@ -1,6 +1,7 @@
 from enum import Enum
 
 class InstrumentType(Enum):
+    #Same instruments found in the toy data lake.
     APPLE_INC = "AAPL"
     MICROSOFT_CORPORATION = "MSFT"
     ALPHABET_INC = "GOOGL"
@@ -13,5 +14,6 @@ class InstrumentType(Enum):
     TESLA_INC = "TSLA"
 
 class Indicators(Enum):
+    #Same indicators found in the toy data lake.
     VOLUME = "volume"
     PRICE = "price"

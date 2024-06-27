@@ -11,7 +11,7 @@ import pyarrow as pa
 class AAPLVolumeStrategy(BaseStrategy):
     def setup_strategy(self):
         """
-        Define the specific settings for the AAPL volume monitoring strategy.
+        Define the specific queries for the AAPL volume monitoring strategy.
         """
         self.name = "Apple Volume Monitoring"
     
@@ -44,8 +44,9 @@ class AAPLVolumeStrategy(BaseStrategy):
         
 
     def execute(self, data_server):
-        print(f"Executing {self.name}.")
         #This is where the strategy will use the tickets to actually get record batches with data needed
+        #This toy strategy simply prints the record batches it requested
+        print(f"Executing {self.name}.")
         client = pa_f.FlightClient(location=data_server)  # Specify your data server location
 
         for query, tickets in self.query_to_tickets.items():

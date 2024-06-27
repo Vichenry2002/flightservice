@@ -5,7 +5,7 @@ from models.query import QDQuery
 
 class BaseStrategy(ABC):
     """
-    Abstract base class for trading or operational strategies.
+    Abstract base class for strategies.
     Each strategy subclass must implement all abstract methods.
     """
 
@@ -29,12 +29,12 @@ class BaseStrategy(ABC):
     @abstractmethod
     def initialize(self, data_server):
         """
-        Initialize the strategy with necessary data and configurations.
-        This might involve setting up data subscriptions, pre-fetching data,
-        or configuring parameters specific to the strategy.
+        Initialize the strategy.
 
         This is where we will send flight descriptors to data server 
-        (maybe obtain tickets for each flight desc)
+        (maybe obtain tickets for each flight desc).
+
+        This allows the dataserver to prepare the data that will then be used in the execute method.
         """
         pass
 

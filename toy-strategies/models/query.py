@@ -10,7 +10,6 @@ T = TypeVar("T", bound="QDQuery")
 
 class QDQuery(BaseModel):
     model_config = ConfigDict(frozen=True)
-
     datasource: str
     instruments: Sequence[InstrumentType]
     indicators: Sequence[Indicators]

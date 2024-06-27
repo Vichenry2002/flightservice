@@ -6,6 +6,7 @@ def main():
 
     load_dotenv()
     data_server_url = os.getenv('DATA_SERVER')
+    #testing strategy AAPLVolumeStrategy.
     strategy = AAPLVolumeStrategy()
     strategy.initialize(data_server_url)
     strategy.execute(data_server_url)
