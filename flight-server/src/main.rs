@@ -115,7 +115,7 @@ impl MyFlightService {
     }
 
     //utility function
-    fn process_data(data: Value) -> Result<RecordBatch, Status> {
+    fn data_to_record_batch(data: Value) -> Result<RecordBatch, Status> {
         // Extract the inner "data" object directly
         let map = data.get("data").and_then(|v| v.as_object()).ok_or_else(|| Status::internal("Missing 'data' field or not an object"))?;
     
@@ -139,13 +139,16 @@ impl MyFlightService {
                 }
             }
         }
-    
+        
+        //DON'T THINK THIS IS NECESSARY DUE TO LINE 137/138
         // Ensure all vectors in indicator_values are of the same length
+        /*
         for values in indicator_values.values_mut() {
-            while values.len() < instrument_names.len() {
-                values.push(None); // Pad with None if any indicators are missing
-            }
+          //  while values.len() < instrument_names.len() {
+            //    values.push(None); // Pad with None if any indicators are missing
+            //}
         }
+        */
     
         // Create the schema for the RecordBatch
         let mut fields = vec![
@@ -265,7 +268,7 @@ impl FlightService for MyFlightService {
                         if resp.status().is_success() {
                             let data: Value = resp.json().await.unwrap(); // handle JSON response
                             //tranform JSON data into record batch
-                            let new_batch =  MyFlightService::process_data(data);
+                            let new_batch =  MyFlightService::data_to_record_batch(data);
 
                             match new_batch {
                                 Ok(batch) => {
